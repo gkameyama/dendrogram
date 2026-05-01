@@ -30,3 +30,6 @@ release/
 # User directories
 R/
 xxx/
+
+# Generated image output
+*.sps
