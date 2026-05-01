@@ -26,3 +26,7 @@ release/
 *.jpg
 *.jpeg
 .R/
+
+# User directories
+R/
+xxx/
