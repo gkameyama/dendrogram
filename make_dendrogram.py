@@ -18,7 +18,6 @@ from scipy.spatial.distance import squareform
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_EXCEL_PATH = SCRIPT_DIR / "SBT2501_data.xlsx"
 
 LINE_WIDTH = 1.4
 
@@ -58,10 +57,13 @@ def resolve_excel_path(candidate: Path | None) -> Path:
             raise FileNotFoundError(f"Excel file not found: {path}")
         return path
 
-    if DEFAULT_EXCEL_PATH.exists():
-        return DEFAULT_EXCEL_PATH
-
-    xlsx_files = sorted(SCRIPT_DIR.glob("*.xlsx"))
+    xlsx_files = sorted(
+        path
+        for path in SCRIPT_DIR.glob("*.xlsx")
+        if not path.name.startswith("~$")
+        and "_chisqd_" not in path.stem
+        and "_dendrogram_" not in path.stem
+    )
     if not xlsx_files:
         raise FileNotFoundError("No xlsx file was found in the script directory.")
     if len(xlsx_files) == 1:
