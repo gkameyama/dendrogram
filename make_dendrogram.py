@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import re
 from datetime import datetime
 from pathlib import Path
+import re
 
 import matplotlib
 
@@ -14,29 +14,27 @@ import numpy as np
 import pandas as pd
 from matplotlib import font_manager
 from scipy.cluster.hierarchy import dendrogram, linkage
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import squareform
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_EXCEL_PATH = SCRIPT_DIR / "SBT2501_data.xlsx"
-VALID_CLUSTER_MODES = ("chi2_average", "chi2_ward", "sqeuclidean_average")
 
-# Priority:
-# 1. chi2_ward: keep Ward's method to stay close to the conventional output.
-# 2. chi2_average: fallback that is more natural for pure chi-square distance.
-CLUSTER_MODE = "chi2_ward"
 LINE_WIDTH = 1.4
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a dendrogram image from an Excel workbook."
+        description=(
+            "Create a dendrogram from a co-occurrence matrix using the SPSS-equivalent "
+            "chi-square distance (chisqd) and Ward's method."
+        )
     )
     parser.add_argument(
         "--input",
         type=Path,
         default=None,
-        help="Excel file path. If omitted, the script auto-detects an xlsx file.",
+        help="Excel file path (data sheet = square co-occurrence matrix, name sheet = labels).",
     )
     parser.add_argument(
         "--output",
@@ -45,10 +43,10 @@ def parse_args() -> argparse.Namespace:
         help="Output image path.",
     )
     parser.add_argument(
-        "--mode",
-        choices=VALID_CLUSTER_MODES,
-        default=CLUSTER_MODE,
-        help="Clustering mode.",
+        "--output-matrix",
+        type=Path,
+        default=None,
+        help="Output Excel path for the distance matrix (default: auto-generated alongside the image).",
     )
     return parser.parse_args()
 
@@ -64,26 +62,32 @@ def resolve_excel_path(candidate: Path | None) -> Path:
         return DEFAULT_EXCEL_PATH
 
     xlsx_files = sorted(SCRIPT_DIR.glob("*.xlsx"))
-    if len(xlsx_files) == 1:
-        return xlsx_files[0]
     if not xlsx_files:
         raise FileNotFoundError("No xlsx file was found in the script directory.")
+    if len(xlsx_files) == 1:
+        return xlsx_files[0]
 
-    names = ", ".join(path.name for path in xlsx_files)
+    names = ", ".join(p.name for p in xlsx_files)
     raise FileNotFoundError(
-        "Multiple xlsx files were found. Use --input to specify one: "
-        f"{names}"
+        "Multiple xlsx files were found. Use --input to specify one: " f"{names}"
     )
 
 
-def build_output_path(excel_path: Path, output_path: Path | None) -> Path:
-    if output_path is not None:
-        return output_path.expanduser().resolve()
-
+def build_output_path(excel_path: Path, output_path: Path | None) -> tuple[Path, str]:
     stem_prefix = excel_path.stem.split("_", 1)[0].strip() or excel_path.stem
     timestamp = datetime.now().strftime("%m%d%H%M")
-    file_name = f"{stem_prefix}_dendrogram_{timestamp}.png"
-    return (SCRIPT_DIR / file_name).resolve()
+    if output_path is not None:
+        return output_path.expanduser().resolve(), timestamp
+    return (SCRIPT_DIR / f"{stem_prefix}_dendrogram_{timestamp}.png").resolve(), timestamp
+
+
+def build_matrix_output_path(
+    excel_path: Path, matrix_path: Path | None, timestamp: str
+) -> Path:
+    if matrix_path is not None:
+        return matrix_path.expanduser().resolve()
+    stem_prefix = excel_path.stem.split("_", 1)[0].strip() or excel_path.stem
+    return (SCRIPT_DIR / f"{stem_prefix}_chisqd_{timestamp}.xlsx").resolve()
 
 
 def set_japanese_font() -> None:
@@ -109,7 +113,7 @@ def normalize_code(value: object) -> str:
 
 
 def find_name_sheet(workbook: pd.ExcelFile) -> str:
-    preferred = [sheet for sheet in workbook.sheet_names if sheet.lower() == "name"]
+    preferred = [s for s in workbook.sheet_names if s.lower() == "name"]
     if preferred:
         return preferred[0]
 
@@ -122,7 +126,7 @@ def find_name_sheet(workbook: pd.ExcelFile) -> str:
 
 
 def find_data_sheet(workbook: pd.ExcelFile) -> str:
-    preferred = [sheet for sheet in workbook.sheet_names if sheet.lower() == "data"]
+    preferred = [s for s in workbook.sheet_names if s.lower() == "data"]
     if preferred:
         return preferred[0]
 
@@ -172,83 +176,67 @@ def load_matrix(workbook: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
     return numeric
 
 
+def chisqd(X: np.ndarray) -> np.ndarray:
+    """SPSS PROXIMITIES MEASURE=CHISQ VIEW=VARIABLE と同等の距離行列を計算する。
+
+    各列ペア (i, j) について共起行列の2列を取り出し、カイ2乗統計量の平方根を距離とする。
+    R の chisqd() 関数（chisqd.r）と完全に同じ結果を返す。
+
+    Parameters
+    ----------
+    X : ndarray, shape (V, V)
+        正方な共起行列（対称・非負）。
+
+    Returns
+    -------
+    D : ndarray, shape (V, V)
+        ペア間のカイ2乗距離行列（対角 = 0）。
+    """
+    V = X.shape[1]
+    D = np.zeros((V, V))
+
+    for i in range(V):
+        for j in range(i + 1, V):
+            mat = np.column_stack([X[:, i], X[:, j]])   # V×2
+            row_sums = mat.sum(axis=1, keepdims=True)
+            col_sums = mat.sum(axis=0)
+            grand = mat.sum()
+
+            if grand == 0:
+                continue
+
+            ex = (row_sums * col_sums) / grand          # V×2 期待値
+
+            with np.errstate(invalid="ignore", divide="ignore"):
+                y = (mat - ex) ** 2 / ex
+                y[np.isnan(y)] = 0                       # 期待値=0 のセルを除外
+
+            d = np.sqrt(y.sum())
+            D[i, j] = D[j, i] = d
+
+    return D
+
+
 def format_label(code: str, label: str) -> str:
     match = re.search(r"\.(\d+)$", code)
     suffix = match.group(1).zfill(2) if match else code
     return f"{label} {suffix}"
 
 
-def chi_square_distance_matrix(matrix: pd.DataFrame) -> np.ndarray:
-    values = matrix.to_numpy(dtype=float)
-    grand_total = values.sum()
-    if grand_total <= 0:
-        raise ValueError("data sheet total must be greater than 0.")
-
-    row_sums = values.sum(axis=1, keepdims=True)
-    col_masses = values.sum(axis=0) / grand_total
-
-    if np.any(row_sums == 0):
-        raise ValueError("Chi-square distance cannot be computed because some row sums are 0.")
-    if np.any(col_masses == 0):
-        raise ValueError(
-            "Chi-square distance cannot be computed because some column masses are 0."
-        )
-
-    row_profiles = values / row_sums
-    weighted_profiles = row_profiles / np.sqrt(col_masses)
-    condensed = pdist(weighted_profiles, metric="euclidean")
-    return squareform(condensed)
-
-
-def chi_square_ward_features(matrix: pd.DataFrame) -> np.ndarray:
-    values = matrix.to_numpy(dtype=float)
-    grand_total = values.sum()
-    row_sums = values.sum(axis=1, keepdims=True)
-    col_masses = values.sum(axis=0) / grand_total
-
-    if grand_total <= 0:
-        raise ValueError("data sheet total must be greater than 0.")
-    if np.any(row_sums == 0):
-        raise ValueError("Ward features cannot be built because some row sums are 0.")
-    if np.any(col_masses == 0):
-        raise ValueError("Ward features cannot be built because some column masses are 0.")
-
-    row_profiles = values / row_sums
-    return row_profiles / np.sqrt(col_masses)
-
-
-def squared_euclidean_distance_matrix(matrix: pd.DataFrame) -> np.ndarray:
-    values = matrix.to_numpy(dtype=float)
-    if values.size == 0:
-        raise ValueError("The data sheet is empty.")
-    condensed = pdist(values, metric="sqeuclidean")
-    return squareform(condensed)
-
-
-def build_linkage(matrix: pd.DataFrame, cluster_mode: str) -> np.ndarray:
-    if cluster_mode == "chi2_average":
-        chi2_dist = chi_square_distance_matrix(matrix)
-        return linkage(squareform(chi2_dist), method="average")
-
-    if cluster_mode == "chi2_ward":
-        features = chi_square_ward_features(matrix)
-        return linkage(features, method="ward", metric="euclidean")
-
-    if cluster_mode == "sqeuclidean_average":
-        sqeuclidean_dist = squared_euclidean_distance_matrix(matrix)
-        return linkage(squareform(sqeuclidean_dist), method="average")
-
-    raise ValueError(
-        "CLUSTER_MODE must be one of "
-        f"{', '.join(repr(mode) for mode in VALID_CLUSTER_MODES)}."
-    )
+def save_distance_matrix(
+    dist_matrix: np.ndarray, codes: list[str], matrix_path: Path
+) -> None:
+    df = pd.DataFrame(dist_matrix, index=codes, columns=codes)
+    df.index.name = None
+    with pd.ExcelWriter(matrix_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="chisqd")
 
 
 def main() -> None:
     args = parse_args()
     excel_path = resolve_excel_path(args.input)
-    output_path = build_output_path(excel_path, args.output)
-    cluster_mode = args.mode
+    output_path, timestamp = build_output_path(excel_path, args.output)
+    matrix_path = build_matrix_output_path(excel_path, args.output_matrix, timestamp)
 
     set_japanese_font()
 
@@ -264,7 +252,14 @@ def main() -> None:
         raise ValueError(f"Codes missing in the label sheet: {missing_codes}")
 
     labels = [format_label(code, label_map[code]) for code in matrix.columns]
-    linkage_matrix = build_linkage(matrix, cluster_mode)
+    codes = list(matrix.columns)
+
+    dist_matrix = chisqd(matrix.to_numpy(dtype=float))
+
+    save_distance_matrix(dist_matrix, codes, matrix_path)
+
+    condensed = squareform(dist_matrix)
+    linkage_matrix = linkage(condensed, method="ward")
 
     plt.figure(figsize=(12, 18))
     dendrogram(
@@ -276,16 +271,17 @@ def main() -> None:
         color_threshold=0,
         link_color_func=lambda _: "black",
     )
-    plt.title(f"Dendrogram ({cluster_mode})")
+    plt.title("Dendrogram (SPSS chi-square distance, Ward)")
     plt.xlabel("Distance")
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-    print(f"input : {excel_path}")
-    print(f"data  : {data_sheet}")
-    print(f"label : {name_sheet}")
-    print(f"saved : {output_path}")
+    print(f"input  : {excel_path}")
+    print(f"data   : {data_sheet}")
+    print(f"label  : {name_sheet}")
+    print(f"matrix : {matrix_path}")
+    print(f"saved  : {output_path}")
 
 
 if __name__ == "__main__":
