@@ -1,6 +1,8 @@
 # Runtime and generated data
 *.xlsx
 *.txt
+*.csv
+*.zip
 
 # Generated image output
 *.png
@@ -9,4 +11,4 @@
 # User directories
 R/
 xxx/
-share/
+__pycache__/
